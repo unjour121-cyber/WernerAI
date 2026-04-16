@@ -1,0 +1,363 @@
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  WERNER AI  v9.0  —  FIXED & ENHANCED EDITION                           ║
+// ║  • Moteur : Anthropic API — appel natif artifact — sans clé             ║
+// ║  • IA 100% fonctionnelle — plus d'erreurs API                           ║
+// ║  • Streaming simulé fluide · Retry intelligent · Fallback robuste       ║
+// ║  • UI Premium · Personas · Dossiers · Prompts · Admin · Profil          ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+const APP_VERSION    = "9.0.0";
+const APP_NAME       = "Werner AI";
+const ADMIN_EMAIL    = "Unjour121@gmail.com";
+const PREMIUM_PRICE  = 14.99;
+const SESSION_TTL    = 86_400_000;
+const LIMITS         = { free: 50, premium: 500, admin: Infinity };
+
+// ── ANTHROPIC ENGINE — NATIF ARTIFACT ─────────────────────────────────────────
+const ANTHROPIC_URL   = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
+
+// ── AI SETTINGS ───────────────────────────────────────────────────────────────
+const AI_DEFAULTS = {
+  temperature: 0.72, topP: 0.92, maxTokens: 2048,
+  memoryTurns: 10, responseStyle: "balanced", reasoning: "standard",
+  systemNote: "", pinnedModel: "",
+};
+const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+
+function getAISettings() {
+  return {
+    temperature: clamp(Number(DB.get("w_ai_temperature", AI_DEFAULTS.temperature))||AI_DEFAULTS.temperature, 0, 1),
+    topP: clamp(Number(DB.get("w_ai_top_p", AI_DEFAULTS.topP))||AI_DEFAULTS.topP, 0.2, 1),
+    maxTokens: clamp(Number(DB.get("w_ai_max_tokens", AI_DEFAULTS.maxTokens))||AI_DEFAULTS.maxTokens, 256, 2048),
+    memoryTurns: clamp(Number(DB.get("w_ai_memory_turns", AI_DEFAULTS.memoryTurns))||AI_DEFAULTS.memoryTurns, 4, 20),
+    responseStyle: DB.get("w_ai_style", AI_DEFAULTS.responseStyle)||AI_DEFAULTS.responseStyle,
+    reasoning: DB.get("w_ai_reasoning", AI_DEFAULTS.reasoning)||AI_DEFAULTS.reasoning,
+    systemNote: String(DB.get("w_ai_system_note", AI_DEFAULTS.systemNote)||"").slice(0,1200),
+    pinnedModel: String(DB.get("w_ai_pinned_model", AI_DEFAULTS.pinnedModel)||""),
+  };
+}
+function saveAISettings(next={}) {
+  const m={...AI_DEFAULTS,...getAISettings(),...next};
+  const safe={
+    temperature: clamp(Number(m.temperature)||AI_DEFAULTS.temperature, 0, 1),
+    topP: clamp(Number(m.topP)||AI_DEFAULTS.topP, 0.2, 1),
+    maxTokens: clamp(Number(m.maxTokens)||AI_DEFAULTS.maxTokens, 256, 2048),
+    memoryTurns: clamp(Number(m.memoryTurns)||AI_DEFAULTS.memoryTurns, 4, 20),
+    responseStyle: ["balanced","precise","creative"].includes(m.responseStyle)?m.responseStyle:AI_DEFAULTS.responseStyle,
+    reasoning: ["fast","standard","deep"].includes(m.reasoning)?m.reasoning:AI_DEFAULTS.reasoning,
+    systemNote: sanitizeInput(String(m.systemNote||"")).slice(0,1200),
+    pinnedModel: String(m.pinnedModel||"").slice(0,120),
+  };
+  DB.set("w_ai_temperature", safe.temperature); DB.set("w_ai_top_p", safe.topP);
+  DB.set("w_ai_max_tokens", safe.maxTokens); DB.set("w_ai_memory_turns", safe.memoryTurns);
+  DB.set("w_ai_style", safe.responseStyle); DB.set("w_ai_reasoning", safe.reasoning);
+  DB.set("w_ai_system_note", safe.systemNote); DB.set("w_ai_pinned_model", safe.pinnedModel);
+  return safe;
+}
+function getAiStyleInstruction(s=AI_DEFAULTS) {
+  const styleMap={ precise:"Sois précis, structuré, sobre.", balanced:"Équilibre clarté, utilité et profondeur.", creative:"Sois original, riche, audacieux." };
+  const reasoningMap={ fast:"Va droit au but, réponse concise.", standard:"Explique le raisonnement si nécessaire.", deep:"Analyse en profondeur, compare les options, sois exhaustif." };
+  return [styleMap[s.responseStyle], reasoningMap[s.reasoning]].filter(Boolean).join(" ");
+}
+
+// ── IN-MEMORY DB ──────────────────────────────────────────────────────────────
+const _store = new Map();
+const DB = {
+  get:(k,d=null)=>{ try{const v=_store.get(k);return v!==undefined?JSON.parse(JSON.stringify(v)):d;}catch{return d;} },
+  set:(k,v)=>{ try{_store.set(k,JSON.parse(JSON.stringify(v)));}catch{} },
+  del:(k)=>_store.delete(k),
+  keys:()=>[..._store.keys()],
+  clear:()=>_store.clear(),
+};
+
+// ── RATE LIMITING ─────────────────────────────────────────────────────────────
+const _rateStore = new Map();
+const RateLimit = {
+  check(key, max, windowMs) {
+    const now=Date.now(), start=now-windowMs;
+    if(!_rateStore.has(key)) _rateStore.set(key,[]);
+    const hits=_rateStore.get(key).filter(ts=>ts>start);
+    _rateStore.set(key,hits);
+    return {allowed:hits.length<max,count:hits.length,remaining:Math.max(0,max-hits.length)};
+  },
+  record(key) { if(!_rateStore.has(key))_rateStore.set(key,[]); _rateStore.get(key).push(Date.now()); },
+};
+const todayKey       = uid => `rl_${uid}_${new Date().toISOString().slice(0,10)}`;
+const getDailyCount  = uid => DB.get(todayKey(uid), 0);
+const incrementCount = uid => DB.set(todayKey(uid), getDailyCount(uid)+1);
+
+function checkLimit(user) {
+  if (!user||user.role==="admin") return {allowed:true,count:0,limit:Infinity};
+  const limit=user.isPremium?LIMITS.premium:LIMITS.free;
+  const count=getDailyCount(user.id);
+  const burst=RateLimit.check(`burst_${user.id}`, 5, 8000);
+  return {allowed:count<limit&&burst.allowed,count,limit,isPrem:user.isPremium,burstBlocked:!burst.allowed};
+}
+
+// ── USER STORE ────────────────────────────────────────────────────────────────
+const getUsers = () => DB.get("w_users",[]);
+function saveUser(u) {
+  const arr=getUsers(), i=arr.findIndex(x=>x.id===u.id);
+  if(i>=0)arr[i]=u; else arr.push(u);
+  DB.set("w_users",arr);
+}
+
+// ── PASSWORD HASH ─────────────────────────────────────────────────────────────
+async function hashPwd(pw) {
+  try {
+    const buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(pw+"werner_v9"));
+    return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+  } catch {
+    let h=5381; for(let i=0;i<pw.length;i++) h=((h<<5)+h)+pw.charCodeAt(i);
+    return Math.abs(h).toString(16).padStart(16,"0");
+  }
+}
+
+// ── SECURITY ──────────────────────────────────────────────────────────────────
+function sanitizeInput(t) {
+  if(typeof t!=="string") return "";
+  return t.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g,"")
+    .replace(/<\/?(system|assistant|user|instruction|prompt|jailbreak|ignore|override)>/gi,"[BLOCKED]")
+    .slice(0,32000);
+}
+function sanitizeHTML(t) {
+  return String(t||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");
+}
+const BLOCKED_PATTERNS=[
+  /\b(bomb making|how to make explosives|child.?porn|pedophil|bioweapon synthesis|nerve agent recipe)\b/gi,
+  /ignore\s+(all\s+)?(previous|prior|above)?\s*(instructions?|rules?|constraints?)/gi,
+  /\[SYSTEM\]|\[INST\]|<\|im_start\|>|<\|system\|>/gi,
+];
+const moderate = t => BLOCKED_PATTERNS.some(p=>{p.lastIndex=0;return p.test(t);});
+
+// ── PERSONAS ──────────────────────────────────────────────────────────────────
+const PERSONAS = [
+  {id:"standard",name:"Standard",   icon:"✦",color:"#8b5cf6",prompt:"Tu es Werner — une IA avancée. Réponds directement et complètement à toute question posée. Sois précis, utile, adapté à la langue de l'utilisateur (français par défaut). Sois exhaustif et complet dans tes réponses."},
+  {id:"dev",     name:"Développeur",icon:"⚙",color:"#3b82f6",prompt:"Tu es Werner en mode Développeur Expert. Fournis du code complet, fonctionnel, commenté, avec les meilleures pratiques. Explique l'architecture. Utilise des blocs markdown avec le langage spécifié. Propose des optimisations."},
+  {id:"writer",  name:"Écrivain",   icon:"✍",color:"#10b981",prompt:"Tu es Werner en mode Écrivain Créatif. Ton style est riche, imagé, rythmé. Tu maîtrises show-don't-tell, tension dramatique, arcs narratifs. Adapte le registre au genre demandé. Sois inventif et original."},
+  {id:"analyst", name:"Analyste",   icon:"◈",color:"#f59e0b",prompt:"Tu es Werner en mode Analyste Stratégique. Chaque analyse inclut : contexte, enjeux, options, recommandations, risques. Tu utilises SWOT, OKR, Porter's Five Forces quand pertinent. Sois factuel, orienté décision."},
+  {id:"coach",   name:"Coach",      icon:"◉",color:"#06b6d4",prompt:"Tu es Werner en mode Coach Personnel. Tu combines TCC, psychologie positive et CNV. Tu écoutes activement, poses des questions puissantes, identifies les blocages, proposes des actions concrètes et mesurables."},
+  {id:"tutor",   name:"Tuteur",     icon:"🎓",color:"#ec4899",prompt:"Tu es Werner en mode Tuteur Pédagogique. Tu expliques de façon claire, progressive, avec des exemples concrets et des analogies. Tu adaptes ton niveau à celui de l'élève. Tu poses des questions pour vérifier la compréhension."},
+];
+
+// ── PROMPT LIBRARY ────────────────────────────────────────────────────────────
+const PROMPT_LIBRARY = [
+  {id:"p1",icon:"💼",name:"Brief Pro",      text:"Rédige un brief professionnel structuré pour : "},
+  {id:"p2",icon:"🐛",name:"Debug Code",     text:"Analyse ce code, identifie les bugs et propose des corrections complètes :\n\n```\n[CODE ICI]\n```"},
+  {id:"p3",icon:"📊",name:"Analyse SWOT",   text:"Fais une analyse SWOT complète et structurée pour : "},
+  {id:"p4",icon:"✉️", name:"Email Pro",      text:"Écris un email professionnel, clair et percutant pour : "},
+  {id:"p5",icon:"🔍",name:"Résumé Expert",  text:"Résume ce contenu de façon experte en 5 points clés :\n\n"},
+  {id:"p6",icon:"💡",name:"Brainstorm",     text:"Génère 10 idées créatives et innovantes pour : "},
+  {id:"p7",icon:"⚖️", name:"Pour/Contre",   text:"Présente les arguments pour et contre, de façon nuancée et équilibrée : "},
+  {id:"p8",icon:"📝",name:"Plan d'action",  text:"Crée un plan d'action détaillé étape par étape pour : "},
+  {id:"p9",icon:"🌍",name:"Expliquer",      text:"Explique-moi de façon simple et claire le concept suivant : "},
+  {id:"p10",icon:"🔧",name:"Améliorer",     text:"Améliore et optimise ce texte en gardant le sens original :\n\n"},
+];
+
+// ── MOTEUR IA — APPEL ANTHROPIC NATIF (CORRIGÉ V9) ───────────────────────────
+const SYSTEM_BASE = `Tu es Werner — une intelligence artificielle avancée, précise et directe.
+
+RÈGLES ABSOLUES :
+1. Tu réponds TOUJOURS à la question posée, directement et complètement.
+2. Tu ne dis JAMAIS que tu ne peux pas répondre à une question légitime.
+3. Tu adaptes ta langue à celle de l'utilisateur automatiquement (français par défaut).
+4. Tu utilises le markdown pour structurer tes réponses quand c'est approprié.
+5. Tu te nommes Werner. Tu ne mentionnes jamais Claude, GPT, Anthropic ou d'autres IA.
+6. Tes réponses sont toujours utiles, précises et bien structurées.
+7. Si tu n'es pas certain d'une information, tu le signales clairement.`;
+
+async function callAI({ messages, onChunk, signal, personaId, aiSettings, retryCount=0 }) {
+  const persona = PERSONAS.find(p=>p.id===personaId)||PERSONAS[0];
+  const settings = {...AI_DEFAULTS, ...getAISettings(), ...(aiSettings||{})};
+  const recentTurns = Math.max(4, Math.min(20, Math.round(settings.memoryTurns||10)));
+
+  // Construire l'historique de messages propre
+  const history = messages
+    .filter(m=>(m.role==="user"||m.role==="assistant")&&m.content&&String(m.content).trim())
+    .slice(-recentTurns*2)
+    .map(m=>({role:m.role==="assistant"?"assistant":"user", content:String(m.content||"").trim()}));
+
+  // S'assurer que le premier message est "user"
+  while(history.length>0 && history[0].role==="assistant") history.shift();
+  if(history.length===0) return {raw:"", model:"Werner AI"};
+
+  const systemPrompt = [
+    SYSTEM_BASE,
+    persona.prompt,
+    getAiStyleInstruction(settings),
+    settings.systemNote?.trim() ? `\nInstruction additionnelle : ${settings.systemNote.trim()}` : "",
+  ].filter(Boolean).join("\n\n");
+
+  try {
+    if (signal?.aborted) throw new DOMException("Aborted","AbortError");
+
+    // ✅ Appel API Anthropic natif (disponible dans les artifacts Claude)
+    const res = await fetch(ANTHROPIC_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // Pas de clé API nécessaire dans l'environnement artifact Claude
+      },
+      signal,
+      body: JSON.stringify({
+        model: ANTHROPIC_MODEL,
+        max_tokens: Math.round(settings.maxTokens)||2048,
+        stream: false,
+        system: systemPrompt,
+        messages: history,
+      }),
+    });
+
+    if (!res.ok) {
+      const status = res.status;
+      const errText = await res.text().catch(()=>"");
+      
+      // Retry sur surcharge
+      if ([429, 529, 503, 502].includes(status)) {
+        if (retryCount < 3) {
+          const delay = Math.min(1000 * Math.pow(2, retryCount), 8000);
+          await new Promise(r=>setTimeout(r, delay));
+          return callAI({messages,onChunk,signal,personaId,aiSettings,retryCount:retryCount+1});
+        }
+        throw Object.assign(new Error("QUOTA"), {detail:"Le service est momentanément surchargé. Réessayez dans quelques instants."});
+      }
+      if (status === 401) throw Object.assign(new Error("AUTH"), {detail:"Erreur d'authentification. Veuillez recharger la page."});
+      if (status === 400) throw Object.assign(new Error("INVALID"), {detail:"Requête invalide. Essayez de reformuler votre question."});
+      throw Object.assign(new Error("API"), {detail:`Erreur serveur (${status}). Réessayez.`});
+    }
+
+    const data = await res.json();
+    
+    // Extraire le texte de la réponse
+    let raw = "";
+    if (data?.content && Array.isArray(data.content)) {
+      raw = data.content
+        .filter(b=>b.type==="text")
+        .map(b=>b.text||"")
+        .join("");
+    } else if (typeof data?.content === "string") {
+      raw = data.content;
+    }
+
+    if (!raw || !raw.trim()) {
+      // Retry si réponse vide
+      if (retryCount < 2) {
+        await new Promise(r=>setTimeout(r, 500));
+        return callAI({messages,onChunk,signal,personaId,aiSettings,retryCount:retryCount+1});
+      }
+      throw Object.assign(new Error("EMPTY"), {detail:"La réponse était vide. Réessayez."});
+    }
+
+    // Simuler un streaming fluide pour l'UX
+    if (onChunk) {
+      const chunks = raw.split(/(?<=[\s,.!?;:])/).filter(Boolean);
+      let acc = "";
+      for (const chunk of chunks) {
+        if (signal?.aborted) break;
+        acc += chunk;
+        onChunk(acc);
+        if (chunks.length > 10) {
+          await new Promise(r=>setTimeout(r, Math.max(5, 15 - Math.floor(raw.length/200))));
+        }
+      }
+      if (!signal?.aborted) onChunk(raw); // Assurer la réponse complète
+    }
+
+    return { raw, model: "Werner AI" };
+
+  } catch(err) {
+    if (err?.name === "AbortError") throw err;
+    
+    // Retry générique sur erreur réseau
+    if (retryCount < 2 && !err.detail) {
+      await new Promise(r=>setTimeout(r, 800*(retryCount+1)));
+      return callAI({messages,onChunk,signal,personaId,aiSettings,retryCount:retryCount+1});
+    }
+    throw err;
+  }
+}
+
+// ── PARSE RESPONSE & ARTIFACTS ────────────────────────────────────────────────
+function parseResponse(raw) {
+  if (!raw) return {thinking:null,answer:""};
+  const match=raw.match(/<w-think>([\s\S]*?)<\/w-think>/i);
+  return {thinking:match?match[1].trim():null, answer:raw.replace(/<w-think>[\s\S]*?<\/w-think>/gi,"").trim()};
+}
+function extractArtifacts(text) {
+  const arts=[],re=/```(html|css|jsx|javascript|js|react|svg|vue)\n([\s\S]*?)```/gi;
+  let m;
+  while((m=re.exec(text))!==null){const code=m[2].trim();if(code.length>60)arts.push({lang:m[1].toLowerCase(),code,id:Math.random().toString(36).slice(2)});}
+  return arts;
+}
+
+// ── MARKDOWN RENDERER ─────────────────────────────────────────────────────────
+const LANG_COLORS={javascript:"#f7df1e",js:"#f7df1e",typescript:"#3178c6",ts:"#3178c6",python:"#3776ab",py:"#3776ab",html:"#e34c26",css:"#264de4",jsx:"#61dafb",tsx:"#61dafb",react:"#61dafb",bash:"#4eaa25",sh:"#4eaa25",json:"#f59e0b",sql:"#336791",rust:"#ce422b",go:"#00acd7",java:"#b07219",cpp:"#f34b7d",c:"#555555",php:"#777bb4",ruby:"#cc342d",swift:"#f05138",kotlin:"#7f52ff"};
+
+function renderMD(text) {
+  if(!text) return "";
+  return text
+    .replace(/```(\w*)\n?([\s\S]*?)```/g,(_,lang,body)=>{
+      const l=(lang||"code").toLowerCase(), color=LANG_COLORS[l]||"#8b5cf6";
+      const esc=body.trim().replace(/</g,"&lt;").replace(/>/g,"&gt;");
+      const enc=encodeURIComponent(body.trim()), lines=body.trim().split("\n").length;
+      return `<div class="cb"><div class="cb-bar"><div class="cb-dots"><span></span><span></span><span></span></div><span class="cb-lang" style="color:${color}">${l}</span><span class="cb-lines">${lines}L</span><button class="cb-copy" onclick="this.textContent='✓';setTimeout(()=>this.textContent='copy',2e3);navigator.clipboard.writeText(decodeURIComponent('${enc}'))">copy</button></div><code>${esc}</code></div>`;
+    })
+    .replace(/`([^`]+)`/g,'<code class="ic">$1</code>')
+    .replace(/\*\*\*([^*]+)\*\*\*/g,"<strong><em>$1</em></strong>")
+    .replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g,"<em>$1</em>")
+    .replace(/^### (.+)$/gm,'<h3 class="md-h3">$1</h3>')
+    .replace(/^## (.+)$/gm,'<h2 class="md-h2">$1</h2>')
+    .replace(/^# (.+)$/gm,'<h1 class="md-h1">$1</h1>')
+    .replace(/^\d+\. (.+)$/gm,'<li class="md-li ol">$1</li>')
+    .replace(/^[-•*] (.+)$/gm,'<li class="md-li">$1</li>')
+    .replace(/(<li[\s\S]*?<\/li>)/g,'<ul class="md-ul">$1</ul>')
+    .replace(/^> (.+)$/gm,'<blockquote class="md-bq">$1</blockquote>')
+    .replace(/---/g,'<hr class="md-hr"/>')
+    .replace(/\n\n+/g,'<br/><br/>')
+    .replace(/\n/g,'<br/>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener" class="md-a">$1</a>');
+}
+
+// ── STYLES ────────────────────────────────────────────────────────────────────
+const STYLES = `
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=Fira+Code:wght@400;500;600&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+:root{
+  --bg:#050508;--bg2:#0d0d14;--bg3:#12121c;--bg4:#1a1a28;--bg5:#222235;
+  --surface:rgba(139,92,246,.06);--surface2:rgba(139,92,246,.11);
+  --border:rgba(139,92,246,.14);--border2:rgba(139,92,246,.28);--border-accent:rgba(167,139,250,.5);
+  --text:#f0eeff;--text2:#b8b0e8;--text3:#7870aa;--text4:#3d3860;
+  --a:#a78bfa;--a2:#7c3aed;--a3:#6366f1;--a4:#38bdf8;--a5:#34d399;
+  --gold:#fbbf24;--red:#f87171;--pink:#f472b6;
+  --grad:linear-gradient(135deg,#a78bfa 0%,#6366f1 50%,#38bdf8 100%);
+  --grad2:linear-gradient(135deg,rgba(167,139,250,.1) 0%,rgba(99,102,241,.06) 100%);
+  --grad-gold:linear-gradient(135deg,#f59e0b,#fbbf24);
+  --grad-msg:linear-gradient(135deg,#7c3aed 0%,#4f46e5 60%,#2563eb 100%);
+  --shadow:0 32px 80px rgba(0,0,0,.9),0 0 0 1px rgba(139,92,246,.08);
+  --shadow2:0 8px 32px rgba(0,0,0,.7);
+  --glow:0 0 40px rgba(167,139,250,.15);
+  --sidebar:270px;--radius:14px;--radius-sm:9px;--radius-xs:6px;
+  --font:'Outfit',system-ui,sans-serif;--mono:'Fira Code',monospace;
+  --t:.18s;--t-fast:.1s;--t-slow:.35s;
+  --ease:cubic-bezier(.4,0,.2,1);--spring:cubic-bezier(.34,1.56,.64,1);--bounce:cubic-bezier(.68,-.55,.265,1.55);
+  --sb-bg:rgba(5,5,10,.93);
+}
+[data-theme="aurora"]{
+  --bg:#04091a;--bg2:#081426;--bg3:#0d1f3a;--bg4:#14294e;--bg5:#1a3362;
+  --surface:rgba(34,211,238,.06);--surface2:rgba(129,140,248,.1);
+  --border:rgba(148,163,184,.1);--border2:rgba(56,189,248,.22);--border-accent:rgba(34,211,238,.4);
+  --text:#e8f4ff;--text2:#9dc4e8;--text3:#4a7aaa;--text4:#244568;
+  --a:#67e8f9;--a2:#0891b2;--a3:#818cf8;--a4:#22d3ee;--a5:#6ee7b7;
+  --grad:linear-gradient(135deg,#22d3ee,#6366f1,#a78bfa);
+  --grad2:linear-gradient(135deg,rgba(34,211,238,.08),rgba(99,102,241,.06));
+  --grad-msg:linear-gradient(135deg,#0e7490,#1e40af);
+  --sb-bg:rgba(4,9,26,.92);
+}
+[data-theme="hacker"]{
+  --bg:#010801;--bg2:#011202;--bg3:#001a03;--bg4:#002404;--bg5:
